@@ -1,0 +1,8 @@
+# Files Anki generates inside the add-on folder
+__pycache__/
+*.pyc
+meta.json
+user_files/
+
+# Built packages
+*.ankiaddon

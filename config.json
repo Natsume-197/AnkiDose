@@ -1,0 +1,9 @@
+{
+    "hours": 5,
+    "block_minutes": 60,
+    "behind_mode": "spread",
+    "count_new": false,
+    "block_end_notice": "dialog",
+    "system_notifications": true,
+    "sound": true
+}
