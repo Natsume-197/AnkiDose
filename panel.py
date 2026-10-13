@@ -34,7 +34,7 @@ def fmt_dur(seconds: float) -> str:
         return "<1 min"
     if m < 60:
         return f"{m} min"
-    return f"{m // 60} h {m % 60:02d} min"
+    return f"{m // 60} h" if m % 60 == 0 else f"{m // 60} h {m % 60:02d} min"
 
 
 def plural(n: int, word: str) -> str:
@@ -61,6 +61,7 @@ class Status:
     learning: int = 0  # cards in (re)learning: they don't count, but they'll come back
     spc: float = 10.0  # seconds per card (includes the time spent relearning failed cards)
     out_of_cards: bool = False  # the deck has no reviews left
+    extra: bool = False  # the current block is extra time added after the plan ran out
 
     @property
     def finished(self) -> bool:
@@ -105,7 +106,7 @@ def short_text(st: Status) -> str:
         return f"Plan complete ✓ {st.done_total}/{st.total}"
     if st.finished:
         return f"Time's up · {st.done_total}/{st.total}"
-    head = f"Block {st.k + 1}/{st.nblocks}"
+    head = "Extra time" if st.extra else f"Block {st.k + 1}/{st.nblocks}"
     if st.block_complete:
         nxt = f" · next {hhmm(st.block_end)}" if st.k + 1 < st.nblocks else ""
         return f"{head} ✓ {st.done_block}/{st.quota}{nxt}"
@@ -228,7 +229,8 @@ def segments_html(st: Status) -> str:
             pct, color = min(100, round(100 * done / quota)), ACCENT
         else:
             pct, color = 0, ACCENT
-        title = f"Block {j + 1}: {done}/{quota}" if reached else f"Block {j + 1}"
+        name = "Extra time" if st.extra and j == st.nblocks - 1 else f"Block {j + 1}"
+        title = f"{name}: {done}/{quota}" if reached else name
         segs.append(
             f'<div class="seg" title="{title}"><div style="width:{pct}%;background:{color}"></div></div>'
         )
@@ -288,63 +290,19 @@ def kpi(label: str, value: str) -> str:
     return f'<div class="kpi"><div class="s">{label}</div><div>{value}</div></div>'
 
 
-def hero(st: Status) -> tuple[str, str, str]:
-    """(main line, what goes next to it in gray, line below) depending on the plan's state."""
-    if st.plan_complete:
-        sub = "No reviews left in the deck." if st.out_of_cards and st.goal_lowered else "You won today."
-        return "Plan complete", "", sub
-    if st.finished:
-        return str(st.done_total), f"/ {st.total}", "The plan's time is up."
-    if st.block_complete:
-        if st.k + 1 < st.nblocks:
-            return f"Block {st.k + 1} done", "", f"The next one opens at {hhmm(st.block_end)}."
-        return "Last block done", "", ""
-    return (
-        str(st.done_block),
-        f"/ {st.quota}",
-        f"~{fmt_dur(st.block_time_left)} · until {hhmm(st.block_end)}",
-    )
+def button(label: str, command: str, primary: bool = False) -> str:
+    cls = ' class="pri"' if primary else ""
+    return f"<button{cls} onclick=\"pycmd('ankidose:{command}')\">{label}</button>"
 
 
-def render_panel(
-    st: Status,
-    deck_name: str,
-    streak: int,
-    accuracy: int | None,
-    details_open: bool,
-) -> str:
-    main, beside, sub = hero(st)
+def link(label: str, command: str) -> str:
+    return f"<a onclick=\"pycmd('ankidose:{command}')\">{label}</a>"
 
-    if st.plan_complete or st.finished:
-        title, chip = escape(deck_name), ""
-    else:
-        title = f"{escape(deck_name)} · block {st.k + 1} of {st.nblocks}"
-        if st.delta > 0:
-            chip = f'<span style="color:{GREEN}">+{st.delta} ahead</span>'
-        elif st.delta < 0:
-            chip = f'<span style="color:{AMBER}">{-st.delta} behind</span>'
-        else:
-            chip = '<span class="s">on pace</span>'
 
-    total = f"{st.done_total} of {st.total} total"
-    if st.goal_lowered and not st.plan_complete:
-        total += f" (goal adjusted, was {st.planned_total})"
-    learning = f"{st.learning} in learning" if st.learning else ""
-
-    left = "none ✓" if st.plan_complete else f"~{fmt_dur(st.time_left)}"
-    kpis = (
-        kpi("Time left", left)
-        + kpi("Accuracy", f"{accuracy}%" if accuracy is not None else "—")
-        + kpi("Streak", plural(streak, "day"))
-    )
-    open_attr = " open" if details_open else ""
-    beside_html = f'<span class="s">{beside}</span>' if beside else ""
-
+def panel_css() -> str:
     # 3-size type scale: 26px (main line), 14px (text), 12px (secondary).
-    # Background, border, radius and shadow match Anki's deck list.
-    return f"""
-<div class="ankidose">
-<style>
+    # Background, border, radius and shadow match Anki's deck list; buttons keep Anki's style.
+    return f"""<style>
 {ACCENT_CSS}
 .ankidose {{ max-width:440px; margin:16px auto; padding:16px 18px; text-align:left; font-size:14px;
           line-height:1.4; color:var(--fg, inherit); font-variant-numeric:tabular-nums;
@@ -368,14 +326,97 @@ def render_panel(
                border-radius:var(--border-radius, 6px); padding:8px 10px; white-space:nowrap; }}
 .ankidose .kpi .s {{ margin-bottom:2px; }}
 .ankidose .key {{ display:inline-flex; align-items:center; gap:4px; margin-left:10px; }}
-</style>
+.ankidose .actions {{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:12px; }}
+.ankidose .actions button {{ margin:0; font-size:12px; }}
+.ankidose .actions .pri {{ background:{ACCENT}; color:#fff; border-color:transparent; }}
+.ankidose .links {{ margin-left:auto; font-size:12px; }}
+.ankidose .links a {{ color:{SUBTLE}; text-decoration:none; cursor:pointer; margin-left:10px; }}
+.ankidose .links a:hover {{ color:var(--fg, inherit); text-decoration:underline; }}
+.ankidose .x {{ background:none; border:none; box-shadow:none; padding:0 2px; margin:0;
+               font-size:16px; line-height:1; color:{SUBTLE}; cursor:pointer; }}
+</style>"""
+
+
+def hero(st: Status) -> tuple[str, str, str]:
+    """(main line, what goes next to it in gray, line below) depending on the plan's state."""
+    if st.plan_complete:
+        if st.done_total == 0:
+            return "Nothing to review", "", "No reviews left in this deck."
+        sub = "No reviews left in the deck." if st.out_of_cards and st.goal_lowered else "You won today."
+        return "Plan complete", "", sub
+    if st.finished:
+        return str(st.done_total), f"/ {st.total}", f"Time's up · ~{fmt_dur(st.time_left)} to finish"
+    if st.block_complete:
+        if st.k + 1 < st.nblocks:
+            return f"Block {st.k + 1} done", "", f"The next one opens at {hhmm(st.block_end)}."
+        return "Last block done", "", ""
+    return (
+        str(st.done_block),
+        f"/ {st.quota}",
+        f"~{fmt_dur(st.block_time_left)} · until {hhmm(st.block_end)}",
+    )
+
+
+def unfinished_actions(st: Status) -> str:
+    """What you can do when the plan's time runs out before you finish."""
+    return f"""
+<div class="actions">
+  {button("+1 h", "extend:60", primary=True)}{button("+30 min", "extend:30")}{button("+2 h", "extend:120")}
+  <span class="links">{link("New plan", "rest")}{link("Close", "close")}</span>
+</div>"""
+
+
+def render_panel(
+    st: Status,
+    deck_name: str,
+    streak: int,
+    accuracy: int | None,
+    details_open: bool,
+) -> str:
+    main, beside, sub = hero(st)
+
+    if st.plan_complete or st.finished:
+        title, chip = escape(deck_name), ""
+    else:
+        where = "extra time" if st.extra else f"block {st.k + 1} of {st.nblocks}"
+        title = f"{escape(deck_name)} · {where}"
+        if st.extra:
+            chip = ""  # "behind" vs. the original plan isn't useful once you chose to keep going
+        elif st.delta > 0:
+            chip = f'<span style="color:{GREEN}">+{st.delta} ahead</span>'
+        elif st.delta < 0:
+            chip = f'<span style="color:{AMBER}">{-st.delta} behind</span>'
+        else:
+            chip = '<span class="s">on pace</span>'
+
+    total = f"{st.done_total} of {st.total} total"
+    if st.goal_lowered and not st.plan_complete:
+        total += f" (goal adjusted, was {st.planned_total})"
+    learning = f"{st.learning} in learning" if st.learning else ""
+
+    left = "none ✓" if st.plan_complete else f"~{fmt_dur(st.time_left)}"
+    kpis = (
+        kpi("Time left", left)
+        + kpi("Accuracy", f"{accuracy}%" if accuracy is not None else "—")
+        + kpi("Streak", plural(streak, "day"))
+    )
+    open_attr = " open" if details_open else ""
+    beside_html = f'<span class="s">{beside}</span>' if beside else ""
+    unfinished = st.finished and not st.plan_complete
+    actions = unfinished_actions(st) if unfinished else ""
+    footer = "" if unfinished else f'<div class="row s"><span>{total}</span><span>{learning}</span></div>'
+
+    return f"""
+<div class="ankidose">
+{panel_css()}
 <div class="row"><span class="s">{title}</span><span style="font-size:12px">{chip}</span></div>
 <div class="hero">
   {ring_svg(st)}
   <div><div class="main"><b>{main}</b>{beside_html}</div><div class="sub">{sub}</div></div>
 </div>
 {segments_html(st)}
-<div class="row s"><span>{total}</span><span>{learning}</span></div>
+{footer}
+{actions}
 <details{open_attr} ontoggle="pycmd('ankidose:details:' + (this.open ? 1 : 0))">
   <summary>Details</summary>
   <div class="kpis">{kpis}</div>
@@ -384,4 +425,35 @@ def render_panel(
     <span class="key"><span style="width:14px;border-top:2px dashed {SUBTLE}"></span>plan</span></div>
   {pace_svg(st)}
 </details>
+</div>"""
+
+
+# ---------------------------------------------------------------- summary of the last plan
+
+
+def render_summary(last: dict, when: str, due: int, suggestion: tuple[int, float] | None) -> str:
+    """Card shown after a plan from a previous day is closed: a goal for today and how it went."""
+    if last.get("completed"):
+        before = f"{when} you finished all {last['done']} 🎉"
+    else:
+        before = f"{when} you did {last['done']} of {last['total']}"
+    if suggestion:
+        cards, hours = suggestion
+        main = f'<b>{cards}</b><span class="s">cards in {fmt_dur(hours * 3600)}</span>'
+        sub = f"Suggested for today · {before}"
+        actions = f"""<div class="actions">{button("Start plan", "suggest", primary=True)}
+  <span class="links" style="margin-left:4px">{link("Edit", "custom")}</span></div>"""
+    else:
+        main = "<b>All caught up</b>"
+        sub = f"No reviews due today · {before}"
+        actions = ""
+
+    return f"""
+<div class="ankidose">
+{panel_css()}
+<div class="row"><span class="s">{escape(last.get('deck_name', ''))}</span>
+  <button class="x" title="Dismiss" onclick="pycmd('ankidose:dismiss')">×</button></div>
+<div class="main" style="margin-top:8px">{main}</div>
+<div class="sub">{sub}</div>
+{actions}
 </div>"""

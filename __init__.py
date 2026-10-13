@@ -44,6 +44,7 @@ from .panel import (
     overlay_state,
     plural,
     render_panel,
+    render_summary,
     short_text,
 )
 
@@ -142,7 +143,7 @@ def log_plan(plan: dict, st: Status) -> None:
             "deck": plan.get("deck_name", ""),
             "total": st.total,
             "done": st.done_total,
-            "completed": st.plan_complete,
+            "completed": st.plan_complete and st.done_total > 0,  # an empty plan isn't a streak day
         }
     )
     save_history(history[-365:])
@@ -265,9 +266,13 @@ def compute(plan: dict) -> Status:
     now = time.time()
     start = plan["start"]
     block_s = plan["block_min"] * 60
-    end = start + plan["hours"] * 3600
+    base_end = start + plan["hours"] * 3600
     nblocks = plan_shape(plan["hours"], plan["block_min"])
-    k = min(max(int((now - start) // block_s), 0), nblocks - 1)
+    # Extra time (see extend_plan) is one more block at the end with everything that was left.
+    extra = plan.get("extra")
+    in_extra = bool(extra) and now >= base_end
+    end = extra["end"] if extra else base_end
+    k = nblocks if in_extra else min(max(int((now - start) // block_s), 0), nblocks - 1)
 
     times = first_times(plan)
     done_total = len(times)
@@ -290,23 +295,38 @@ def compute(plan: dict) -> Status:
 
     frozen = plan.setdefault("quotas", {})  # each block's quota, frozen when the block starts
     blocks = []
-    for j in range(k + 1):
+    last_regular = nblocks - 1 if in_extra else k
+    for j in range(last_regular + 1):
         before = done_until(start + j * block_s)
-        after = done_total if j == k else done_until(start + (j + 1) * block_s)
+        if j == k:
+            after = done_total
+        else:
+            after = done_until(min(start + (j + 1) * block_s, base_end))
         if str(j) not in frozen:
             frozen[str(j)] = block_quota(plan, j, nblocks, before, total)
             dirty = True
-        quota = frozen[str(j)]
-        if j == k and remaining is not None:
-            quota = min(quota, after - before + remaining)  # don't ask for more than what's left
-        blocks.append((after - before, quota))
+        blocks.append((after - before, frozen[str(j)]))
+    if in_extra:
+        before = done_until(extra["start"])
+        if "extra" not in frozen:
+            frozen["extra"] = max(0, total - before)  # everything that was left when you extended
+            dirty = True
+        blocks.append((done_total - before, frozen["extra"]))
+    if remaining is not None:  # don't ask for more than what's left in the deck
+        done_k, quota_k = blocks[k]
+        blocks[k] = (done_k, min(quota_k, done_k + remaining))
     if dirty:
         save_plan(plan)
 
-    bstart = start + k * block_s
+    if in_extra:
+        bstart, bend = extra["start"], extra["end"]
+    else:
+        bstart = start + k * block_s
+        bend = min(bstart + block_s, end)
     return Status(
         k=k,
-        nblocks=nblocks,
+        nblocks=nblocks + (1 if extra else 0),
+        extra=in_extra,
         quota=blocks[k][1],
         done_block=blocks[k][0],
         done_total=done_total,
@@ -318,7 +338,7 @@ def compute(plan: dict) -> Status:
         start=start,
         block_len=block_s,
         block_start=bstart,
-        block_end=min(bstart + block_s, end),
+        block_end=bend,
         end=end,
         now=now,
         blocks=blocks,
@@ -338,12 +358,26 @@ def panel_for(plan: dict) -> str:
 
 
 def on_js_message(handled, message, context):
-    """The panel sends pycmd('ankidose:details:1/0') when you open or close "Details"."""
-    if not isinstance(message, str) or not message.startswith("ankidose:details:"):
+    """Commands sent by the panel with pycmd('ankidose:...')."""
+    if not isinstance(message, str) or not message.startswith("ankidose:"):
         return handled
-    data = read_store()
-    data.setdefault("ui", {})["details_open"] = message.endswith(":1")
-    write_store(data)
+    cmd, _, arg = message[len("ankidose:"):].partition(":")
+    if cmd == "details":  # "Details" opened or closed: remember it
+        data = read_store()
+        data.setdefault("ui", {})["details_open"] = arg == "1"
+        write_store(data)
+        return (True, None)
+    actions = {
+        "extend": lambda: extend_plan(int(arg)),
+        "rest": plan_with_rest,
+        "close": close_unfinished,
+        "suggest": start_suggested,
+        "custom": custom_from_summary,
+        "dismiss": dismiss_summary,
+    }
+    if cmd in actions:
+        # run after the webview callback returns: some actions open dialogs or redraw the page
+        QTimer.singleShot(0, actions[cmd])
     return (True, None)
 
 
@@ -394,6 +428,9 @@ def show_notice(msg: str, interactive: bool) -> None:
 
 
 def notify_plan_complete(st: Status, interactive: bool) -> None:
+    if st.done_total == 0:
+        show_notice("No reviews left in this deck, so there's nothing to plan.", interactive)
+        return
     if st.out_of_cards and st.goal_lowered:
         msg = f"No reviews left in the deck! Plan complete with {plural(st.done_total, 'card')}. 🎉"
     else:
@@ -420,6 +457,8 @@ def notify_block_done(st: Status, interactive: bool) -> None:
 
 
 def notify_block_start(st: Status, mode: str) -> None:
+    if st.extra:
+        return  # extend_plan already announced the extra time
     if st.quota == 0:
         msg = f"Block {st.k + 1}/{st.nblocks} is open, but you're ahead: nothing to do. 😎"
     else:
@@ -448,6 +487,9 @@ _last_key: str | None = None
 def check(interactive: bool = False) -> None:
     """Check the status and fire notifications. `interactive` = triggered by answering a card."""
     global _last_key
+    if close_if_stale():
+        refresh_views()
+        return
     plan = load_plan()
     if not plan:
         return
@@ -499,6 +541,165 @@ def finalize_plan(plan: dict) -> None:
         log_plan(plan, compute(plan))
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------- unfinished plans
+
+
+def refresh_views() -> None:
+    if mw.state == "deckBrowser":
+        mw.deckBrowser.refresh()
+    elif mw.state == "overview":
+        mw.overview.refresh()
+
+
+def archive_plan(plan: dict, st: Status, dismissed: bool = False) -> None:
+    """Close the plan and keep a short summary of how it went (shown the next day)."""
+    log_plan(plan, st)
+    if st.plan_complete and st.times:
+        hours = max(0.25, (st.times[-1] - st.start) / 3600)  # how long it really took
+    else:
+        hours = max(0.25, (min(st.now, st.end) - st.start) / 3600)
+    data = read_store()
+    data.pop("plan", None)
+    data["last"] = {
+        "did": plan["did"],
+        "deck_name": plan.get("deck_name", ""),
+        "done": st.done_total,
+        "total": st.total,
+        "completed": st.plan_complete,
+        "rate": st.done_total / hours,
+        "day": day_key(plan["start"]),
+        "block_min": plan["block_min"],
+        "mode": plan_mode(plan),
+        "include_new": plan.get("include_new", False),
+        "dismissed": dismissed,
+    }
+    write_store(data)
+
+
+def close_if_stale() -> bool:
+    """A plan from a previous Anki day that's over (finished or complete) closes by itself."""
+    plan = load_plan()
+    if not plan or day_key(time.time()) == day_key(plan["start"]):
+        return False
+    try:
+        st = compute(plan)
+    except Exception:
+        return False
+    if st.finished or st.plan_complete:  # a plan still running past the day boundary keeps going
+        archive_plan(plan, st)
+        return True
+    return False
+
+
+def extend_plan(minutes: int) -> None:
+    """Add extra time from now, with everything that's left in a single extra block."""
+    plan = load_plan()
+    if not plan:
+        return
+    now = time.time()
+    if plan.get("extra"):
+        plan["extra"]["end"] = now + minutes * 60
+    else:
+        plan["extra"] = {"start": now, "end": now + minutes * 60}
+        plan["announced"] = plan_shape(plan["hours"], plan["block_min"])  # the tooltip below announces it
+    plan["finished_notified"] = False
+    save_plan(plan)
+    st = compute(plan)
+    tooltip(
+        f"Extra time until {hhmm(st.end)}: {plural(st.quota - st.done_block, 'card')} left "
+        f"(~{fmt_dur(st.block_time_left)}). 🚀",
+        period=6000,
+    )
+    check()
+    refresh_views()
+
+
+def plan_with_rest() -> None:
+    plan = load_plan()
+    if not plan:
+        return
+    st = compute(plan)
+    archive_plan(plan, st, dismissed=True)
+    refresh_views()
+    PlanDialog(deck_id=plan["did"], total=max(1, st.total - st.done_total)).exec()
+
+
+def close_unfinished() -> None:
+    plan = load_plan()
+    if not plan:
+        return
+    archive_plan(plan, compute(plan), dismissed=True)
+    tooltip("Plan closed.")
+    refresh_views()
+
+
+def suggestion(last: dict) -> tuple[int, float] | None:
+    """(cards, hours) for today, based on how many cards per hour you really did last time."""
+    due = due_count(last["did"], last.get("include_new", False))
+    if due <= 0:
+        return None
+    hours = float(cfg().get("hours", 5))
+    if last.get("completed"):
+        cards = due
+    else:
+        cards = min(due, int(last["rate"] * hours))
+        if cards >= 50:
+            cards = int(round(cards / 10) * 10)
+        cards = max(min(due, 10), min(due, cards))
+    return cards, hours
+
+
+def summary_when(last: dict) -> str:
+    days = (date.fromisoformat(day_key(time.time())) - date.fromisoformat(last["day"])).days
+    if days <= 0:
+        return "earlier today"
+    if days == 1:
+        return "yesterday"
+    return f"on {date.fromisoformat(last['day']).strftime('%b %d')}"
+
+
+def summary_for(did: int | None = None) -> str:
+    """Summary card of the last closed plan, if there's no active plan and it wasn't dismissed."""
+    last = read_store().get("last")
+    if not last or last.get("dismissed") or (did is not None and did not in deck_ids(last)):
+        return ""
+    due = due_count(last["did"], last.get("include_new", False))
+    return render_summary(last, summary_when(last), due, suggestion(last))
+
+
+def start_suggested() -> None:
+    last = read_store().get("last")
+    sug = suggestion(last) if last else None
+    if not sug:
+        return
+    cards, hours = sug
+    create_plan(
+        did=last["did"],
+        deck_name=last["deck_name"],
+        total=cards,
+        hours=hours,
+        block_min=last["block_min"],
+        mode=last["mode"],
+        include_new=last.get("include_new", False),
+    )
+
+
+def custom_from_summary() -> None:
+    last = read_store().get("last")
+    if not last:
+        return
+    sug = suggestion(last)
+    PlanDialog(deck_id=last["did"], total=sug[0] if sug else None).exec()
+
+
+def dismiss_summary() -> None:
+    data = read_store()
+    if data.get("last"):
+        data["last"]["dismissed"] = True
+        write_store(data)
+    refresh_views()
 
 
 # ---------------------------------------------------------------- on-screen UI
@@ -559,35 +760,84 @@ def on_answer(reviewer, card, ease) -> None:
 
 
 def on_deck_browser(deck_browser, content) -> None:
-    plan = load_plan()
-    if plan:
-        try:
-            content.stats += panel_for(plan)
-        except Exception:
-            pass
+    try:
+        close_if_stale()
+        plan = load_plan()
+        content.stats += panel_for(plan) if plan else summary_for()
+    except Exception:
+        pass
 
 
 def on_overview(overview, content) -> None:
-    plan = load_plan()
-    if plan and mw.col.decks.current()["id"] in deck_ids(plan):
-        try:
-            content.table += panel_for(plan)
-        except Exception:
-            pass
+    try:
+        close_if_stale()
+        plan = load_plan()
+        did = mw.col.decks.current()["id"]
+        if plan:
+            if did in deck_ids(plan):
+                content.table += panel_for(plan)
+        else:
+            content.table += summary_for(did)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- plan dialog
 
 
+def create_plan(
+    did: int,
+    deck_name: str,
+    total: int,
+    hours: float,
+    block_min: int,
+    mode: str,
+    include_new: bool,
+) -> None:
+    old = load_plan()
+    if old:
+        finalize_plan(old)
+
+    plan = {
+        "did": did,
+        "deck_name": deck_name,
+        "total": total,
+        "start": time.time(),
+        "hours": hours,
+        "block_min": block_min,
+        "mode": mode,
+        "include_new": include_new,
+        "announced": 0,
+        "notified_done": -1,
+    }
+    data = read_store()
+    data["plan"] = plan
+    data.pop("last", None)  # a new plan replaces the last plan's summary
+    write_store(data)
+
+    c = cfg()
+    c.update(hours=hours, block_minutes=block_min, behind_mode=mode, count_new=include_new)
+    mw.addonManager.writeConfig(ADDON, c)
+
+    st = compute(plan)
+    tooltip(
+        f"Plan started. Block 1/{st.nblocks}: {plural(st.quota, 'card')} "
+        f"(~{fmt_dur(st.block_time_left)}) until {hhmm(st.block_end)}. 🚀",
+        period=6000,
+    )
+    check()
+    refresh_views()
+
+
 class PlanDialog(QDialog):
-    def __init__(self) -> None:
+    def __init__(self, deck_id: int | None = None, total: int | None = None) -> None:
         super().__init__(mw)
         self.setWindowTitle(f"{TITLE}: new plan")
         c = cfg()
 
         self.deck = QComboBox()
         decks = sorted(mw.col.decks.all_names_and_ids(), key=lambda d: d.name.lower())
-        current = mw.col.decks.current()["id"]
+        current = deck_id if deck_id is not None else mw.col.decks.current()["id"]
         for d in decks:
             self.deck.addItem(d.name, int(d.id))
             if d.id == current:
@@ -644,6 +894,8 @@ class PlanDialog(QDialog):
         for w in (self.total, self.hours, self.block):
             qconnect(w.valueChanged, self.update_preview)
         self.refill_total()
+        if total is not None:
+            self.total.setValue(total)
 
     def refill_total(self, *_) -> None:
         did, include_new = self.deck.currentData(), self.include_new.isChecked()
@@ -668,41 +920,16 @@ class PlanDialog(QDialog):
         self.preview.setText(text)
 
     def accept(self) -> None:
-        old = load_plan()
-        if old:
-            finalize_plan(old)
-
-        plan = {
-            "did": self.deck.currentData(),
-            "deck_name": self.deck.currentText(),
-            "total": self.total.value(),
-            "start": time.time(),
-            "hours": self.hours.value(),
-            "block_min": self.block.value(),
-            "mode": self.mode.currentData(),
-            "include_new": self.include_new.isChecked(),
-            "announced": 0,
-            "notified_done": -1,
-        }
-        save_plan(plan)
-
-        c = cfg()
-        c.update(
-            hours=plan["hours"],
-            block_minutes=plan["block_min"],
-            behind_mode=plan["mode"],
-            count_new=plan["include_new"],
-        )
-        mw.addonManager.writeConfig(ADDON, c)
-
         super().accept()
-        st = compute(plan)
-        tooltip(
-            f"Plan started. Block 1/{st.nblocks}: {plural(st.quota, 'card')} "
-            f"(~{fmt_dur(st.block_time_left)}) until {hhmm(st.block_end)}. 🚀",
-            period=6000,
+        create_plan(
+            did=self.deck.currentData(),
+            deck_name=self.deck.currentText(),
+            total=self.total.value(),
+            hours=self.hours.value(),
+            block_min=self.block.value(),
+            mode=self.mode.currentData(),
+            include_new=self.include_new.isChecked(),
         )
-        check()
 
 
 # ---------------------------------------------------------------- menu

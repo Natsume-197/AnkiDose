@@ -13,6 +13,7 @@ Tell it *"I want to do 700 reviews over the next 5 hours, one block every hour"*
 - **Panel on the deck list:** a progress ring for the current block, a bar split by blocks and, under *Details*, time left, accuracy, streak and your progress line against the plan.
 - **Progress line while reviewing:** a thin line along the top edge of the review screen.
 - **Adapts to the deck:** if the deck runs out of reviews before reaching the goal, the plan counts as complete.
+- **Unfinished plans:** if time runs out, you can extend the plan (+30 min, +1 h, +2 h), start a new plan with the cards that are left, or close it. The next day an unfinished plan closes by itself and you get a short summary with a suggested goal for today, based on how many cards per hour you actually did.
 - **Works with AnkiDroid / AnkiMobile:** progress comes from the review log, so whatever you review on your phone counts as soon as you sync on desktop.
 - **Matches Anki's theme:** uses Anki's own colors in light and dark mode.
 
